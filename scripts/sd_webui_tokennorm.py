@@ -1,26 +1,58 @@
 """
 sd-webui-TokenNorm
 
-Port of the token normalization feature from ComfyUI's
-"CLIP Text Encode (Advanced)" (BlenderNeko/ComfyUI_ADV_CLIP_emb) to
-Stable Diffusion WebUI reForge.
+Port of the token normalization and weight interpretation features from
+ComfyUI's "CLIP Text Encode (Advanced)"
+(BlenderNeko/ComfyUI_ADV_CLIP_emb) to Stable Diffusion WebUI reForge.
 
 This extension registers additional entries into modules.sd_emphasis.options.
 It does not patch any WebUI internals; it only appends to a module level list.
 
-Provided options:
-    - "TokenNorm: mean"        shift token weights so their average becomes 1.0
-    - "TokenNorm: length"      divide the weight of multi-token embeddings
-    - "TokenNorm: length+mean" length first, then mean
+The upstream node exposes two independent axes:
 
-The base behaviour is "No norm" (multiply only, no mean restoration), which
-matches the practical SDXL setup. The "Original" (mean restoring) variants are
-intentionally not provided in this version.
+    token normalization   how the weight VALUES are conditioned
+    weight interpretation how a weight is APPLIED to the embedding
+
+Provided options:
+    - "TokenNorm: mean"         shift token weights so their average is 1.0
+    - "TokenNorm: length"       divide the weight of multi-token embeddings
+    - "TokenNorm: length+mean"  length first, then mean
+    - the same three with a " / comfy" suffix, plus
+      "TokenNorm: none / comfy"
+
+Together with the built-in "No norm" these cover the eight cells of the
+upstream matrix that this extension targets:
+
+    normalization   A1111 style               comfy
+    none            "No norm" (built in)      + "none / comfy"
+    mean            "TokenNorm: mean"         + "mean / comfy"
+    length          "TokenNorm: length"       + "length / comfy"
+    length+mean     "TokenNorm: length+mean"  + "length+mean / comfy"
+
+where "+" is shorthand for the "TokenNorm: " prefix.
+
+Normalization always runs before interpretation, as upstream does: the
+normalization step conditions the weight values, the interpretation step
+applies them.
+
+The three normalization options use the "No norm" application (multiply only,
+no mean restoration), which matches the practical SDXL setup and corresponds to
+upstream's "A1111" interpretation minus the mean restoration step. The
+"Original" (mean restoring) variants are intentionally not provided.
+
+The "/ comfy" suffix denotes the interpretation axis. An option without a
+suffix uses the A1111 style interpretation. The suffix-free name of the
+"no normalization, A1111 interpretation" cell is the built-in "No norm", so it
+is not duplicated here.
 
 Upstream reference:
     BlenderNeko/ComfyUI_ADV_CLIP_emb -> adv_encode.py
         shift_mean_weight()  -> the "mean" step
         divide_length() / _norm_mag()  -> the "length" step
+    ComfyUI -> comfy/sd1_clip.py
+        ClipTokenWeightEncoder.encode_token_weights() -> the "comfy" step.
+        adv_encode.py delegates the comfy interpretation to ComfyUI itself, so
+        the formula lives there rather than in the upstream extension.
 
 Divergence from upstream (documented in README):
 
@@ -54,6 +86,30 @@ Divergence from upstream (documented in README):
         ordinary tokens and rescaling them would diverge from upstream, which
         treats each of those words as a separate 1-token word and leaves them
         at 1.5.
+
+    comfy:
+        None known. The reference point z_empty is the encoder output for an
+        empty chunk, which reForge produces as
+
+            [id_start, id_end, id_pad * chunk_length]
+
+        after process_tokens() overwrites everything past the first id_end with
+        id_pad. This is the same sequence as ComfyUI's gen_empty_tokens(), and
+        it was verified on hardware by comparing it against the z of an
+        actually empty prompt: identical to the last digit for both CLIP-L and
+        CLIP-G. The distinction matters only for CLIP-G, where id_pad differs
+        from id_end.
+
+        z_empty depends solely on the encoder, the checkpoint and the CLIP skip
+        setting, never on the prompt. It is therefore computed once and cached
+        on the encoder object. This was verified on hardware across four
+        prompts, two checkpoints and two CLIP skip settings: the maximum
+        absolute difference between recomputations was exactly 0.
+
+        Note that the pooled output is not affected by weights in ComfyUI
+        either; ClipTokenWeightEncoder returns the pooled tensor of the first
+        section untouched. reForge likewise carries pooled around the Emphasis
+        step in process_tokens(), so nothing is needed here.
 """
 
 import logging
@@ -61,7 +117,9 @@ import os
 import sys
 import traceback
 
-from modules import script_callbacks, shared
+import torch
+
+from modules import devices, script_callbacks, scripts, shared
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +129,7 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------
 
 EXTENSION_NAME = "sd-webui-TokenNorm"
-MARKER = "sd_webui_tokennorm_v1"
+MARKER = "sd_webui_tokennorm_v2"
 
 # CLIP / OpenCLIP BPE end-of-text token id. Used only as a last resort when the
 # vocabulary cannot be reached. Both CLIP-L and OpenCLIP-bigG use 49407.
@@ -81,6 +139,15 @@ FALLBACK_EOS_ID = 49407
 EMBEDDING_TOKEN_ID = 0
 
 DEBUG_ENV_VAR = "SD_WEBUI_SETI_DEBUG"
+
+# Attribute used to cache the empty chunk embedding on an encoder object. One
+# slot per encoder; a changed key overwrites it, so nothing accumulates and no
+# explicit invalidation is required.
+Z_EMPTY_CACHE_ATTR = "_sd_webui_tokennorm_z_empty"
+
+# Written into the infotext when the comfy interpretation could not be applied.
+# Absence of this key means the interpretation was applied normally.
+INFOTEXT_FALLBACK_KEY = "TokenNorm comfy fallback"
 
 
 def _debug_level():
@@ -330,6 +397,283 @@ def divide_length(tokens, multipliers, eos_id):
 
 
 # --------------------------------------------------------------------------
+# comfy weight interpretation
+# --------------------------------------------------------------------------
+
+# Set by the companion Script so that a failure can be recorded in the
+# infotext. None outside of a generation.
+_current_processing = None
+
+# One warning per generation instead of one per chunk.
+_comfy_warned = False
+
+# Defensive guard. encode_with_transformers() does not go through
+# process_tokens(), so after_transformers() cannot be re-entered by the empty
+# chunk encode. The flag only exists so that a third party wrapper that routes
+# it back would degrade to a pass-through instead of recursing forever.
+_in_empty_encode = False
+
+
+def _iter_encoder_candidates():
+    """Yield objects that may be a hijacked text encoder.
+
+    SDXL: shared.sd_model.cond_stage_model is sgm's GeneralConditioner and the
+    encoders live in .embedders (index 0 CLIP-L, index 1 CLIP-G, the rest are
+    ConcatTimestepEmbedderND). SD1.5 lineage: the encoder may sit directly on
+    cond_stage_model.
+    """
+    model = getattr(shared, "sd_model", None)
+    if model is None:
+        return
+
+    conditioner = getattr(model, "cond_stage_model", None)
+    if conditioner is None:
+        return
+
+    embedders = getattr(conditioner, "embedders", None)
+    if embedders is not None:
+        try:
+            for embedder in embedders:
+                yield embedder
+        except Exception:
+            pass
+
+    yield conditioner
+
+
+def _is_text_encoder(candidate):
+    if candidate is None:
+        return False
+    if not callable(getattr(candidate, "encode_with_transformers", None)):
+        return False
+    for attribute in ("id_start", "id_end", "chunk_length"):
+        if getattr(candidate, attribute, None) is None:
+            return False
+    return True
+
+
+def _build_empty_tokens(encoder):
+    """Token row that reForge produces for a chunk of an empty prompt.
+
+    tokenize_line() pads the content to chunk_length with id_end and wraps it
+    in id_start / id_end, then process_tokens() replaces everything after the
+    first id_end with id_pad. With no content that yields
+
+        [id_start, id_end, id_pad * chunk_length]
+
+    which is chunk_length + 2 tokens long, matching the sequence length the
+    encoder is fed during a normal generation.
+    """
+    id_start = int(getattr(encoder, "id_start"))
+    id_end = int(getattr(encoder, "id_end"))
+    id_pad = getattr(encoder, "id_pad", None)
+    id_pad = id_end if id_pad is None else int(id_pad)
+    chunk_length = int(getattr(encoder, "chunk_length"))
+    return [id_start, id_end] + [id_pad] * chunk_length
+
+
+def _z_empty_key():
+    """Everything z_empty depends on besides the encoder object itself.
+
+    The encoder is identified by the object the slot is attached to, so it does
+    not appear here. CLIP skip is included even though it was measured to have
+    no effect on the SDXL path: keeping it costs one extra recomputation on a
+    setting change, whereas omitting it would silently serve a stale tensor if
+    that ever stops being true.
+    """
+    checkpoint = "unknown"
+    try:
+        info = getattr(shared.sd_model, "sd_checkpoint_info", None)
+        if info is not None:
+            checkpoint = str(getattr(info, "name", None)
+                             or getattr(info, "title", None))
+    except Exception:
+        pass
+
+    try:
+        clip_skip = int(getattr(shared.opts, "CLIP_stop_at_last_layers", 1))
+    except Exception:
+        clip_skip = -1
+
+    return (checkpoint, clip_skip)
+
+
+def _get_z_empty(encoder):
+    """Return the encoder output for an empty chunk, cached on the encoder."""
+    global _in_empty_encode
+
+    key = _z_empty_key()
+
+    slot = getattr(encoder, Z_EMPTY_CACHE_ATTR, None)
+    if isinstance(slot, dict) and slot.get("key") == key:
+        cached = slot.get("z", None)
+        if cached is not None:
+            return cached
+
+    tokens = _build_empty_tokens(encoder)
+
+    _in_empty_encode = True
+    try:
+        with torch.no_grad():
+            row = torch.asarray([tokens]).to(devices.device)
+            z_empty = encoder.encode_with_transformers(row)
+    finally:
+        _in_empty_encode = False
+
+    z_empty = z_empty.detach()
+    setattr(encoder, Z_EMPTY_CACHE_ATTR, {"key": key, "z": z_empty})
+
+    _log(1, "computed z_empty for %s: shape %s, key %s"
+         % (type(encoder).__name__, tuple(z_empty.shape), (key,)))
+
+    return z_empty
+
+
+def _resolve_z_empty(z):
+    """Find the empty chunk embedding matching z.
+
+    Returns (z_empty, reason). reason is None on success.
+
+    The encoder is identified by output shape rather than by intercepting the
+    call, so this extension still patches nothing. SDXL exposes 768 and 1280,
+    SD1.5 only 768 and SD2.1 only 1024, so the match is unique in practice. An
+    ambiguous or empty match is reported instead of guessed.
+    """
+    hidden_size = int(z.shape[-1])
+    sequence_length = int(z.shape[-2])
+
+    matches = []
+    inspected = 0
+
+    for candidate in _iter_encoder_candidates():
+        if not _is_text_encoder(candidate):
+            continue
+        inspected += 1
+        try:
+            z_empty = _get_z_empty(candidate)
+        except Exception:
+            _log(1, "empty chunk encode failed for %s:\n%s"
+                 % (type(candidate).__name__, traceback.format_exc()))
+            continue
+        if int(z_empty.shape[-1]) != hidden_size:
+            continue
+        if int(z_empty.shape[-2]) != sequence_length:
+            continue
+        matches.append(z_empty)
+
+    if len(matches) == 1:
+        return matches[0], None
+
+    if not matches:
+        return None, ("no text encoder produced a %d wide empty chunk "
+                      "(%d inspected)" % (hidden_size, inspected))
+
+    return None, ("%d text encoders produced a %d wide empty chunk; "
+                  "ambiguous" % (len(matches), hidden_size))
+
+
+def apply_comfy_interpretation(z, multipliers):
+    """ComfyUI weight interpretation.
+
+    ComfyUI, comfy/sd1_clip.py, ClipTokenWeightEncoder.encode_token_weights:
+
+        z[i][j] = (z[i][j] - z_empty[j]) * weight + z_empty[j]
+
+    applied only where the weight differs from 1.0. z_empty is the encoding of
+    an empty chunk, so it is a per position reference rather than a single
+    vector: weight 0.0 does not silence a token, it returns that position to
+    what an empty prompt would have produced.
+
+    The selection is done with torch.where rather than relying on a weight of
+    1.0 being a no-op, because (z - z_empty) + z_empty is not guaranteed to
+    round back to z. Untouched positions stay bit identical.
+
+    Returns (new_z, reason). reason is None on success; when it is not, z is
+    returned unchanged and the weights have no effect.
+    """
+    if multipliers is None:
+        return z, "multipliers unavailable"
+
+    weights = multipliers.to(device=z.device, dtype=z.dtype)
+    if weights.dim() == 1:
+        weights = weights.unsqueeze(0)
+
+    if int(weights.shape[-1]) != int(z.shape[-2]):
+        return z, ("weight length %d does not match sequence length %d"
+                   % (int(weights.shape[-1]), int(z.shape[-2])))
+
+    changed = weights != 1.0
+    if not bool(changed.any()):
+        # Nothing to interpret. Skipping here also means an empty prompt never
+        # needs an encoder lookup, which matters during model load: the empty
+        # prompt is encoded before shared.sd_model is fully assigned.
+        return z, None
+
+    z_empty, reason = _resolve_z_empty(z)
+    if z_empty is None:
+        return z, reason
+
+    z_empty = z_empty.to(device=z.device, dtype=z.dtype)
+
+    factor = weights.unsqueeze(-1)
+    blended = z_empty + (z - z_empty) * factor
+
+    _log(2, "comfy: %d of %d positions reweighted"
+         % (int(changed.sum()), int(changed.numel())))
+
+    return torch.where(changed.unsqueeze(-1), blended, z), None
+
+
+def _record_comfy_failure(reason):
+    """Warn once and mark the infotext.
+
+    The failure mode is a pass-through, which is indistinguishable from a
+    correct result by eye. Recording it in the infotext is what makes an
+    affected image identifiable afterwards.
+    """
+    global _comfy_warned
+
+    if not _comfy_warned:
+        _warn("comfy interpretation unavailable (%s); token weights have no "
+              "effect for this generation" % reason)
+        _comfy_warned = True
+
+    processing = _current_processing
+    if processing is None:
+        return
+    try:
+        processing.extra_generation_params[INFOTEXT_FALLBACK_KEY] = reason
+    except Exception:
+        pass
+
+
+def _apply_comfy_to(emphasis):
+    """Shared body of every "/ comfy" cell.
+
+    Replaces the multiplication that the A1111 style cells perform. Any
+    failure degrades to a pass-through, which leaves the token weights without
+    effect but never aborts generation.
+    """
+    if _in_empty_encode:
+        return
+
+    try:
+        new_z, reason = apply_comfy_interpretation(
+            emphasis.z, emphasis.multipliers)
+    except Exception:
+        _record_comfy_failure("unhandled exception, see console")
+        _warn("comfy interpretation failed, token weights ignored:\n"
+              + traceback.format_exc())
+        return
+
+    if reason is not None:
+        _record_comfy_failure(reason)
+        return
+
+    emphasis.z = new_z
+
+
+# --------------------------------------------------------------------------
 # Emphasis classes
 # --------------------------------------------------------------------------
 
@@ -390,9 +734,83 @@ try:
                       "unchanged:\n" + traceback.format_exc())
             super().after_transformers()
 
+    class EmphasisTokenNormNoneComfy(sd_emphasis.Emphasis):
+        name = "TokenNorm: none / comfy"
+        description = ("ComfyUI weight interpretation, no token "
+                       "normalization. Interpolates each weighted token "
+                       "towards the embedding of an empty prompt instead of "
+                       "scaling it, reproducing what ComfyUI does with the "
+                       "same prompt.")
+
+        def after_transformers(self):
+            # Note that the "/ comfy" cells do NOT derive from
+            # EmphasisOriginalNoNorm: in the comfy interpretation the
+            # interpolation IS the application of the weight, so no
+            # multiplication takes place.
+            _apply_comfy_to(self)
+
+    class EmphasisTokenNormMeanComfy(sd_emphasis.Emphasis):
+        name = "TokenNorm: mean / comfy"
+        description = ("ComfyUI token normalization (mean) with the ComfyUI "
+                       "weight interpretation. Shifts all token weights so "
+                       "their average becomes 1.0, then interpolates towards "
+                       "the empty prompt embedding. Per chunk.")
+
+        def after_transformers(self):
+            try:
+                eos_id = _resolve_eos_id()
+                self.multipliers = shift_mean_weight(
+                    self.tokens, self.multipliers, eos_id)
+            except Exception:
+                # Never abort generation. Continue with untouched weights.
+                _warn("mean normalization failed, weights left unchanged:\n"
+                      + traceback.format_exc())
+            _apply_comfy_to(self)
+
+    class EmphasisTokenNormLengthComfy(sd_emphasis.Emphasis):
+        name = "TokenNorm: length / comfy"
+        description = ("ComfyUI token normalization (length) with the ComfyUI "
+                       "weight interpretation. Divides the weight of "
+                       "multi-token textual inversion embeddings, then "
+                       "interpolates towards the empty prompt embedding.")
+
+        def after_transformers(self):
+            try:
+                eos_id = _resolve_eos_id()
+                self.multipliers = divide_length(
+                    self.tokens, self.multipliers, eos_id)
+            except Exception:
+                _warn("length normalization failed, weights left unchanged:\n"
+                      + traceback.format_exc())
+            _apply_comfy_to(self)
+
+    class EmphasisTokenNormLengthMeanComfy(sd_emphasis.Emphasis):
+        name = "TokenNorm: length+mean / comfy"
+        description = ("ComfyUI token normalization (length + mean) with the "
+                       "ComfyUI weight interpretation. Applies length "
+                       "division to embeddings first, then shifts the mean to "
+                       "1.0, then interpolates towards the empty prompt "
+                       "embedding. Per chunk.")
+
+        def after_transformers(self):
+            try:
+                eos_id = _resolve_eos_id()
+                weights = divide_length(
+                    self.tokens, self.multipliers, eos_id)
+                self.multipliers = shift_mean_weight(
+                    self.tokens, weights, eos_id)
+            except Exception:
+                _warn("length+mean normalization failed, weights left "
+                      "unchanged:\n" + traceback.format_exc())
+            _apply_comfy_to(self)
+
     _TOKENNORM_OPTIONS = [EmphasisTokenNormMean,
                           EmphasisTokenNormLength,
-                          EmphasisTokenNormLengthMean]
+                          EmphasisTokenNormLengthMean,
+                          EmphasisTokenNormNoneComfy,
+                          EmphasisTokenNormMeanComfy,
+                          EmphasisTokenNormLengthComfy,
+                          EmphasisTokenNormLengthMeanComfy]
 
 except Exception:
     sd_emphasis = None
@@ -487,3 +905,37 @@ try:
     script_callbacks.on_model_loaded(_clear_eos_cache)
 except Exception:
     _warn("failed to register script callbacks:\n" + traceback.format_exc())
+
+
+# --------------------------------------------------------------------------
+# companion Script
+# --------------------------------------------------------------------------
+
+class TokenNormScript(scripts.Script):
+    """Adds no UI. Its only job is to expose the processing object so that a
+    failed comfy interpretation can be recorded in the infotext, and to reset
+    the once-per-generation warning flag.
+
+    Conditioning happens after process() and the infotext is built after
+    sampling, so writing into extra_generation_params from the Emphasis object
+    lands in the saved image regardless of the exact script callback order.
+    """
+
+    def title(self):
+        return EXTENSION_NAME
+
+    def show(self, is_img2img):
+        return scripts.AlwaysVisible
+
+    def process(self, p, *args, **kwargs):
+        global _current_processing, _comfy_warned
+        _current_processing = p
+        _comfy_warned = False
+        try:
+            p.extra_generation_params.pop(INFOTEXT_FALLBACK_KEY, None)
+        except Exception:
+            pass
+
+    def postprocess(self, p, processed, *args, **kwargs):
+        global _current_processing
+        _current_processing = None

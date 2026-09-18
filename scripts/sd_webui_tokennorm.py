@@ -78,14 +78,38 @@ Divergence from upstream (documented in README):
         was confirmed empirically: an N-vector embedding appears as N
         consecutive id==0 tokens.
 
-        Therefore "length" here only rescales runs that consist ENTIRELY of
-        id==0 tokens (embeddings). Ordinary tokens are left untouched, which
-        also matches upstream behaviour for single-token words (sqrt(1) == 1,
-        no change). Multi-word parentheses such as "(fluffy white cat:1.5)" are
-        deliberately NOT rescaled, because in WebUI they are a single run of
-        ordinary tokens and rescaling them would diverge from upstream, which
-        treats each of those words as a separate 1-token word and leaves them
-        at 1.5.
+        Therefore "length" here only rescales textual inversion embeddings.
+        Ordinary tokens are left untouched, which also matches upstream
+        behaviour for single-token words (sqrt(1) == 1, no change). Multi-word
+        parentheses such as "(fluffy white cat:1.5)" are deliberately NOT
+        rescaled, because in WebUI they are a single run of ordinary tokens and
+        rescaling them would diverge from upstream, which treats each of those
+        words as a separate 1-token word and leaves them at 1.5.
+
+        Embedding boundaries (v3):
+        The id==0 placeholders alone cannot separate two embeddings that sit
+        next to each other with the same weight; they merge into one run. With
+        many embeddings in a row this was measured at n=75, which crushed a
+        weight of 1.1 down to 1.0115. The exact boundaries do exist in reForge:
+        tokenize_line() records one PromptChunkFix(offset, embedding) per
+        embedding in PromptChunk.fixes. hijack.fixes is cleared by
+        EmbeddingsWithFixes.forward() before the Emphasis object runs, but the
+        PromptChunk objects themselves are still alive in the caller's frame
+        (TextConditionalModel.forward, local "batch_chunk"). This extension
+        reads them from there WITHOUT patching anything, the same technique the
+        reForge built-in Differential Diffusion uses to find its sigmas. The
+        frame is accepted only if its local "tokens" is the very same list
+        object as Emphasis.tokens, so an unrelated frame can never be used.
+
+        Each embedding then gets its own n = embedding.vectors, placed at
+        row position offset + 1 (index 0 of a row is BOS), which is exactly
+        where EmbeddingsWithFixes inserts the vectors. As a side effect,
+        ordinary "!" tokens (BPE id 0) are no longer mistaken for embeddings.
+
+        If the chunk list cannot be found or does not match the token rows
+        (for example a third party wrapper rebuilt the token list), the old
+        run based detection is used for that generation, a warning is printed
+        once, and the infotext receives "TokenNorm length fallback".
 
     comfy:
         None known. The reference point z_empty is the encoder output for an
@@ -112,6 +136,7 @@ Divergence from upstream (documented in README):
         step in process_tokens(), so nothing is needed here.
 """
 
+import inspect
 import logging
 import os
 import sys
@@ -129,7 +154,7 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------
 
 EXTENSION_NAME = "sd-webui-TokenNorm"
-MARKER = "sd_webui_tokennorm_v2"
+MARKER = "sd_webui_tokennorm_v3"
 
 # CLIP / OpenCLIP BPE end-of-text token id. Used only as a last resort when the
 # vocabulary cannot be reached. Both CLIP-L and OpenCLIP-bigG use 49407.
@@ -148,6 +173,15 @@ Z_EMPTY_CACHE_ATTR = "_sd_webui_tokennorm_z_empty"
 # Written into the infotext when the comfy interpretation could not be applied.
 # Absence of this key means the interpretation was applied normally.
 INFOTEXT_FALLBACK_KEY = "TokenNorm comfy fallback"
+
+# Written into the infotext when the length step could not find the exact
+# embedding boundaries and had to use the old run based detection.
+INFOTEXT_LENGTH_FALLBACK_KEY = "TokenNorm length fallback"
+
+# How many caller frames to inspect when looking for the PromptChunk list.
+# The real chain is: helper -> after_transformers -> process_tokens -> forward,
+# so a small number is enough. The cap only bounds the cost in odd setups.
+FRAME_SEARCH_DEPTH = 12
 
 
 def _debug_level():
@@ -356,13 +390,147 @@ def _norm_mag(w, n):
     return 1.0 + sign * ((d * d) / n) ** 0.5
 
 
-def divide_length(tokens, multipliers, eos_id):
-    """Divide the weight of multi-token embeddings, per chunk.
+# Once-per-generation warning flag for the length fallback. Reset by the
+# companion Script in process().
+_length_warned = False
+
+
+def _find_chunk_fixes(tokens):
+    """Recover the PromptChunkFix lists of the chunk being encoded.
+
+    Walks up the call stack looking for TextConditionalModel.forward, which
+    holds the PromptChunk objects of the current chunk in its local
+    "batch_chunk" and passes "tokens" (built from them) straight on to
+    process_tokens() -> Emphasis.tokens. The frame is accepted only when its
+    "tokens" local IS the same list object as the tokens given here.
+
+    Returns (fixes_per_row, reason). fixes_per_row is a list with one list of
+    (offset, embedding) pairs per row; reason is None on success.
+    """
+    frame = inspect.currentframe()
+    try:
+        depth = 0
+        current = frame.f_back if frame is not None else None
+        while current is not None and depth < FRAME_SEARCH_DEPTH:
+            local_vars = current.f_locals
+            batch_chunk = local_vars.get("batch_chunk", None)
+            frame_tokens = local_vars.get("tokens", None)
+            if batch_chunk is not None and frame_tokens is tokens:
+                try:
+                    fixes = [list(getattr(chunk, "fixes", None) or [])
+                             for chunk in batch_chunk]
+                except Exception:
+                    return None, "chunk list is not iterable"
+                if len(fixes) != len(tokens):
+                    return None, ("chunk count %d does not match row count %d"
+                                  % (len(fixes), len(tokens)))
+                return fixes, None
+            current = current.f_back
+            depth += 1
+        return None, "caller frame holding the chunk list was not found"
+    except Exception:
+        return None, "frame inspection failed"
+    finally:
+        # Break the reference cycle created by holding a frame object.
+        del frame
+
+
+def _record_length_fallback(reason):
+    """Warn once per generation and mark the infotext."""
+    global _length_warned
+
+    if not _length_warned:
+        _warn("length: exact embedding boundaries unavailable (%s); using "
+              "the old run based detection. Adjacent embeddings with the same "
+              "weight may be merged." % reason)
+        _length_warned = True
+
+    processing = _current_processing
+    if processing is None:
+        return
+    try:
+        processing.extra_generation_params[INFOTEXT_LENGTH_FALLBACK_KEY] = reason
+    except Exception:
+        pass
+
+
+def _row_spans_from_fixes(token_row, row_fixes, start, end):
+    """Convert one row's PromptChunkFix list into (span_start, span_end, name).
+
+    Row position = offset + 1, because index 0 of a row is BOS; this is the
+    same placement EmbeddingsWithFixes.forward() uses. Returns None when any
+    fix does not line up with id==0 placeholders, so the caller can fall back
+    for this row instead of rescaling the wrong tokens.
+    """
+    spans = []
+    for fix in row_fixes:
+        try:
+            offset, embedding = fix[0], fix[1]
+            vectors = int(getattr(embedding, "vectors", 0))
+            name = str(getattr(embedding, "name", "?"))
+        except Exception:
+            return None
+        if vectors <= 0:
+            return None
+        span_start = int(offset) + 1
+        span_end = span_start + vectors
+        # tokenize_line() starts a new chunk when an embedding would not fit,
+        # so a genuine fix never runs past the content end. A span that does
+        # means the fixes do not belong to these tokens.
+        if span_start < start or span_end > end:
+            return None
+        for position in range(span_start, span_end):
+            if int(token_row[position]) != EMBEDDING_TOKEN_ID:
+                return None
+        spans.append((span_start, span_end, name))
+    return spans
+
+
+def _divide_length_by_fixes(tokens, multipliers, eos_id, fixes):
+    """Length step using exact embedding boundaries.
+
+    Returns (result, bad_rows). bad_rows lists the row indices whose fixes did
+    not line up; those rows are left untouched here and handled by the legacy
+    path in divide_length().
+    """
+    result = multipliers.clone()
+    width = result.shape[-1] if result.dim() >= 1 else 0
+
+    rows = min(len(tokens), result.shape[0]) if result.dim() >= 2 else 0
+    bad_rows = []
+
+    for row_index in range(rows):
+        start, end = _content_span(tokens[row_index], eos_id, width)
+        if end <= start:
+            continue
+
+        token_row = tokens[row_index]
+        spans = _row_spans_from_fixes(token_row, fixes[row_index], start, end)
+        if spans is None:
+            bad_rows.append(row_index)
+            continue
+
+        for span_start, span_end, name in spans:
+            n = span_end - span_start
+            if n <= 1:
+                continue
+            old_w = float(result[row_index, span_start])
+            new_w = _norm_mag(old_w, n)
+            result[row_index, span_start:span_end] = new_w
+
+            _log(2, "length: row %d embedding '%s' [%d, %d) n=%d w %s -> %s"
+                 % (row_index, name, span_start, span_end, n,
+                    format(old_w, ".6f"), format(new_w, ".6f")))
+
+    return result, bad_rows
+
+
+def _divide_length_legacy(tokens, multipliers, eos_id, only_rows=None):
+    """Old run based length step (v2 behaviour), used only as a fallback.
 
     Only runs that consist entirely of embedding placeholder tokens
-    (id == EMBEDDING_TOKEN_ID) are rescaled. Their token count n is the number
-    of vectors the embedding expands to. Ordinary token runs are left
-    untouched, matching upstream behaviour for single-token words.
+    (id == EMBEDDING_TOKEN_ID) are rescaled. Adjacent embeddings with the same
+    weight cannot be told apart here and are merged into one run.
     """
     result = multipliers.clone()
     width = result.shape[-1] if result.dim() >= 1 else 0
@@ -372,6 +540,8 @@ def divide_length(tokens, multipliers, eos_id):
         return multipliers
 
     for row_index in range(rows):
+        if only_rows is not None and row_index not in only_rows:
+            continue
         start, end = _content_span(tokens[row_index], eos_id, width)
         if end <= start:
             continue
@@ -389,10 +559,45 @@ def divide_length(tokens, multipliers, eos_id):
             new_w = _norm_mag(old_w, n)
             result[row_index, run_start:run_end] = new_w
 
-            _log(2, "length: row %d run [%d, %d) n=%d w %s -> %s"
+            _log(2, "length (legacy): row %d run [%d, %d) n=%d w %s -> %s"
                  % (row_index, run_start, run_end, n,
                     format(old_w, ".6f"), format(new_w, ".6f")))
 
+    return result
+
+
+def divide_length(tokens, multipliers, eos_id):
+    """Divide the weight of multi-token embeddings, per chunk.
+
+    Each textual inversion embedding is rescaled by its own vector count n:
+
+        w_new = 1 + sign(w - 1) * sqrt((w - 1)^2 / n)
+
+    Exact boundaries come from the PromptChunk fixes (see _find_chunk_fixes).
+    Rows without usable fixes fall back to the old run based detection.
+    Ordinary tokens are never changed.
+    """
+    rows = 0
+    try:
+        rows = min(len(tokens), multipliers.shape[0]) \
+            if multipliers.dim() >= 2 else 0
+    except Exception:
+        rows = 0
+    if rows == 0:
+        return multipliers
+
+    fixes, reason = _find_chunk_fixes(tokens)
+    if fixes is None:
+        _record_length_fallback(reason)
+        return _divide_length_legacy(tokens, multipliers, eos_id)
+
+    result, bad_rows = _divide_length_by_fixes(
+        tokens, multipliers, eos_id, fixes)
+    if bad_rows:
+        _record_length_fallback("fixes did not line up with the tokens in "
+                                "row(s) %s" % ", ".join(str(r) for r in bad_rows))
+        result = _divide_length_legacy(tokens, result, eos_id,
+                                       only_rows=set(bad_rows))
     return result
 
 
@@ -913,8 +1118,8 @@ except Exception:
 
 class TokenNormScript(scripts.Script):
     """Adds no UI. Its only job is to expose the processing object so that a
-    failed comfy interpretation can be recorded in the infotext, and to reset
-    the once-per-generation warning flag.
+    failed comfy interpretation or a length fallback can be recorded in the
+    infotext, and to reset the once-per-generation warning flags.
 
     Conditioning happens after process() and the infotext is built after
     sampling, so writing into extra_generation_params from the Emphasis object
@@ -928,11 +1133,13 @@ class TokenNormScript(scripts.Script):
         return scripts.AlwaysVisible
 
     def process(self, p, *args, **kwargs):
-        global _current_processing, _comfy_warned
+        global _current_processing, _comfy_warned, _length_warned
         _current_processing = p
         _comfy_warned = False
+        _length_warned = False
         try:
             p.extra_generation_params.pop(INFOTEXT_FALLBACK_KEY, None)
+            p.extra_generation_params.pop(INFOTEXT_LENGTH_FALLBACK_KEY, None)
         except Exception:
             pass
 

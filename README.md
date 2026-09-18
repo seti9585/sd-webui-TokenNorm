@@ -1,352 +1,345 @@
 # sd-webui-TokenNorm
 
-Port of **token normalization** and **weight interpretation** from ComfyUI's `CLIP Text Encode (Advanced)` node ([BlenderNeko/ComfyUI_ADV_CLIP_emb](https://github.com/BlenderNeko/ComfyUI_ADV_CLIP_emb)) to Stable Diffusion WebUI reForge.
+**English** | [日本語](#日本語)
 
-This extension does **not** patch any WebUI internals. It appends entries to `modules.sd_emphasis.options`, which is a plain module level list. Nothing else in the WebUI is modified, replaced or wrapped.
+An extension for **Stable Diffusion WebUI reForge** that changes how prompt weights such as `(cat:1.5)` are applied.
 
----
+- **mean:** shifts token weights so their average is 1 within each prompt chunk.
+- **length:** moves the weights of multi-slot Textual Inversions closer to 1.
+- **/ comfy:** applies weights using ComfyUI's formula instead of simple multiplication.
 
-## What it does
+Options appear in **Settings → Stable Diffusion → Emphasis mode**. They affect both positive and negative prompts. TokenNorm does not change LoRA strength settings such as `<lora:name:0.8>`.
 
-When you write `(cat:1.5)`, two independent questions have to be answered:
+The weight adjustment methods come from ComfyUI's [CLIP Text Encode (Advanced)](https://github.com/BlenderNeko/ComfyUI_ADV_CLIP_emb) node. The ComfyUI application formula comes from ComfyUI itself. This is a partial port; it does not make reForge and ComfyUI produce identical images.
 
-1. **Should that 1.5 be conditioned first?** A word split into many tokens, or a textual inversion embedding occupying many vectors, receives the weight on every one of them. That may or may not be desirable. This is **token normalization**.
-2. **What does multiplying by 1.5 actually mean?** Where is "zero"? A1111 style scales the embedding from the origin. ComfyUI interpolates from the embedding of an empty prompt. This is **weight interpretation**.
+## Installation and use
 
-The upstream node exposes both axes. This extension provides both.
+1. Open **Extensions → Install from URL** and install:
 
-## Options
+   ```text
+   https://github.com/seti9585/sd-webui-TokenNorm
+   ```
 
-Everything appears in **Settings -> Emphasis**. No UI is added to the generation page.
+2. Stop WebUI and start it again. Use a full process restart after installation.
+3. Select an option under **Settings → Stable Diffusion → Emphasis mode** using the guide below.
+4. Press **Apply settings**, then generate normally.
 
-| normalization | A1111 style application | ComfyUI interpretation |
-|---|---|---|
+To return to WebUI's default weighting, select `Original` and press **Apply settings**.
+
+**Requirements:** reForge is the supported target. Forge Classic / Neo use a different prompt-processing path; A1111 is untested. Keep **Settings → Compatibility → Use old emphasis implementation** off. Extensions that bypass the Emphasis step can also prevent these options from working.
+
+## Choosing an option
+
+| Purpose | Option |
+| --- | --- |
+| Keep WebUI's default weighting | `Original` (built in) |
+| Reduce how far a multi-slot Textual Inversion's weight deviates from 1 | `TokenNorm: length` |
+| Keep the average token weight at 1 within each chunk | `TokenNorm: mean` |
+| Apply length adjustment, then mean adjustment | `TokenNorm: length+mean` |
+| Use ComfyUI's weight application formula without adjusting weights first | `TokenNorm: none / comfy` |
+| Combine an adjustment with ComfyUI's formula | The corresponding `/ comfy` option below |
+
+**Switching from `Original` can change the image even if your written weights stay the same.** `Original` restores the average of the encoded values after weighting; TokenNorm does not perform that final correction. Compare `length` with `No norm` to isolate the length adjustment.
+
+All combinations:
+
+| Weight adjustment | Multiply (based on No norm) | ComfyUI formula |
+| --- | --- | --- |
 | none | `No norm` (built in) | `TokenNorm: none / comfy` |
 | mean | `TokenNorm: mean` | `TokenNorm: mean / comfy` |
 | length | `TokenNorm: length` | `TokenNorm: length / comfy` |
 | length + mean | `TokenNorm: length+mean` | `TokenNorm: length+mean / comfy` |
 
-Naming rule: **no suffix means A1111 style, the `/ comfy` suffix means the ComfyUI interpretation.** The `none` x A1111 cell is WebUI's own `No norm`, so it is not duplicated here.
+## What changes
 
-### Normalization
+A **token** is a piece of the prompt: one tag can contain several tokens, and commas count too. WebUI processes content in **chunks of up to 75 tokens**. A **Textual Inversion** is an embedding file placed in `embeddings` and used by writing its name in the prompt; it can occupy one or more token slots.
 
-**mean** shifts every content token weight by the same amount so that their average becomes exactly 1.0.
+### mean: keep the average weight at 1
 
-```
-delta   = 1 - average(content weights)
+Within each chunk, mean adds the same amount to every content token's weight. An average above 1 lowers all weights; an average below 1 raises them. Commas and Textual Inversion slots participate; start/end markers and padding do not.
+
+For 10 content tokens, with one at 1.5 and nine at 1.0, the average is 1.05. Subtracting 0.05 gives **1.45 and 0.95**.
+
+This adjusts the numerical weights, not a guaranteed amount of influence in the image. A Textual Inversion occupying most of a chunk can dominate that chunk's average.
+
+### length: move Textual Inversion weights closer to 1
+
+length adjusts each multi-slot Textual Inversion according to its number of slots. It reduces both emphasis above 1 and suppression below 1.
+
+For an embedding with 26 slots:
+
+| Input weight | After length |
+| --- | --- |
+| 1.5 | about 1.098 |
+| 0.5 | about 0.902 |
+| 1.0 | 1.0 |
+
+Ordinary words and one-slot embeddings are unchanged. Adjacent embeddings and embeddings grouped as `(A, B, C)` are handled separately when their exact boundaries are available.
+
+**length+mean runs length first, then mean.** Its final weights can therefore differ from the values in this table.
+
+### / comfy: change how the adjusted weight is applied
+
+Without `/ comfy`, the encoded values at each token position are multiplied by the adjusted weight, as in `No norm`.
+
+With `/ comfy`, the reference is the value an empty prompt produces at that position:
+
+- **1:** leaves the position unchanged.
+- **Between 0 and 1:** moves it towards the empty-prompt value.
+- **0:** returns it to the empty-prompt value.
+- **Above 1:** moves it farther away.
+- **Below 0:** moves it past the empty-prompt value to the opposite side.
+
+These are **weights after adjustment**. An input such as `(tag:0)` can become nonzero after mean or length. Neither application method removes the word from the text: weighting happens after encoding, so the word's influence on other positions remains.
+
+With `none / comfy`, an embedding's input weight applies to every slot. With `mean / comfy`, its mean-adjusted weight applies to every slot. Neither adjusts for slot count. If a weighted multi-slot embedding has too much influence, try the corresponding `length / comfy` or `length+mean / comfy` option.
+
+## When an option makes no difference
+
+- **All input weights are 1:** TokenNorm adds no weighting change. Parentheses such as `(tag)` mean 1.1, and `[tag]` means about 0.909, so those are weighted prompts too.
+- **No multi-slot Textual Inversion is weighted:** with normal boundary detection, `length` behaves like `No norm`; `length / comfy` behaves like `none / comfy`.
+- **All content weights in a chunk are equal:** mean brings them to 1. Increasing all of them together does not preserve that increase.
+- **The weights entering mean already average 1:** mean adds no shift. In `length+mean`, this refers to the weights after length.
+
+Emphasis mode is part of reForge's prompt cache key, so changing it triggers prompt re-encoding. Keep the seed and other generation settings fixed when comparing options.
+
+## Troubleshooting
+
+| Symptom | Check or meaning |
+| --- | --- |
+| Switching options has no effect | Check the conditions above, press **Apply settings**, and make sure **Use old emphasis implementation** is off. Check startup warnings for a prompt-processing override. |
+| A startup warning names classes | TokenNorm detected a possible prompt-processing replacement. The warning reports class names, not necessarily the responsible extension. `sd-webui-prevent-artifact` is a known conflicting example. |
+| No `Emphasis` entry in image information | In the standard reForge path, this entry is added when processed prompt text contains `(` or `[` and the mode is not `Original`. `Original` is omitted. |
+| `TokenNorm comfy fallback` | ComfyUI weighting was skipped in some or all processing for that image. The value records a reason; this entry alone does not identify the full affected scope. Check the console too. |
+| `TokenNorm length fallback` | Exact embedding boundaries were unavailable in some processing, so the older detection method was used. Adjacent embeddings may be merged or detected incorrectly. |
+
+For debug output, add `set SD_WEBUI_SETI_DEBUG=2` to `webui-user.bat` **before the line that launches WebUI**, then restart. Level `1` reports startup information; `2` also reports weight adjustments and ComfyUI application. Remove the line and restart to disable it.
+
+<details>
+<summary>Technical notes: formulas, implementation, and differences from ComfyUI</summary>
+
+### Processing order and formulas
+
+Weight adjustment runs before application. `length+mean` runs length, then mean, then the selected application method.
+
+mean, for content weights within one chunk:
+
+```text
+delta = 1 - average(weights)
 weights = weights + delta
 ```
 
-Emphasising one tag therefore pulls every other tag down. The total weight budget stays constant.
+length, for an embedding with n slots and weight w:
 
-**length** divides the weight of a multi-token textual inversion embedding so that the magnitude of the weight change does not grow with the vector count.
-
-```
+```text
 d = w - 1
 w = 1 + sign(d) * sqrt(d * d / n)
 ```
 
-For a 26 vector embedding, `1.5` becomes `1.098058`. Without this, a large embedding written as `(myEmbedding:1.5)` applies 1.5 to all 26 vectors at once.
+Multiply and ComfyUI application, where w is the adjusted weight and z_empty is the encoded empty prompt at the same position:
 
-### Interpretation
-
-**A1111 style** multiplies the embedding by the weight. Weight 0.0 silences the token completely.
-
-**comfy** interpolates towards the embedding of an empty prompt.
-
-```
-z = z_empty + (z - z_empty) * w
+```text
+multiply: z_new = z * w
+comfy:    z_new = z_empty + (z - z_empty) * w
 ```
 
-`z_empty` is a per position reference, not a single vector: it is the encoder output for a chunk containing no content at all. Weight 0.0 therefore does not silence a token, it returns that position to whatever an empty prompt would have produced. Weight 1.0 leaves the position untouched, bit for bit.
+The ComfyUI path explicitly preserves positions whose adjusted weight is 1, avoiding rounding changes from subtracting and adding z_empty. These formulas describe the intended arithmetic; floating-point results may involve rounding.
 
-This is what ComfyUI does natively, so the `/ comfy` cells are the ones to use when you want a prompt to behave the way it does over there.
+### Integration
 
----
+TokenNorm registers options in `modules.sd_emphasis.options` without replacing or wrapping WebUI methods.
 
-## Installation
+For length adjustment, it reads `PromptChunk.fixes` from the caller's chunk objects. The temporary `hijack.fixes` reference has already been cleared, but those objects remain available. The caller's token list must be the same object received by Emphasis, and the embedding spans are checked against the token positions. If this fails, the extension uses its older token-run detection and records `TokenNorm length fallback`.
 
-Extensions -> Install from URL, or clone into `extensions/`:
+### Differences from the Advanced node
 
-```
-git clone https://github.com/seti9585/sd-webui-TokenNorm
-```
+- **mean:** the node calculates over the whole prompt; TokenNorm calculates separately for each chunk.
+- **length:** the node uses word IDs to count tokens per word. TokenNorm uses Textual Inversion boundaries and leaves ordinary words unchanged, even if they span several tokens.
+- **A1111 interpretation:** the node restores the encoded mean after multiplication, corresponding to the principle used by WebUI's `Original`. TokenNorm's multiplication options use `No norm` and omit that restoration.
+- **comfy interpretation:** TokenNorm uses ComfyUI's empty-prompt formula. Tokenization and other processing differences still prevent a guarantee of equivalent conditioning or images.
+- **Other interpretations:** `down_weight`, `compel`, and `comfy++` are not implemented.
 
-Restart the WebUI process. "Apply and restart UI" is not enough, because it does not restart Python.
-
-Then pick an option in **Settings -> Emphasis**.
-
-## Requirements
-
-- **reForge only.** Forge Classic / Neo moved text processing to `backend/text_processing/` and this extension's entry point does not exist there. A1111 upstream is untested.
-- The `sd_emphasis` path must be intact. Any extension that replaces `process_tokens` at class level bypasses it entirely, and every Emphasis option including these has no effect. This extension checks for that on startup and prints a warning naming the offending class.
+</details>
 
 ---
 
-## Divergences from upstream
+# 日本語
 
-Each of these is a deliberate decision, not an oversight.
+[English](#sd-webui-tokennorm) | **日本語**
 
-### The A1111 style cells do not restore the mean
+`(cat:1.5)` のようなプロンプトの重み指定の効き方を変える、**Stable Diffusion WebUI reForge** 用の拡張機能です。
 
-Upstream's `A1111` interpretation multiplies and then rescales the result so the mean is preserved. That is exactly WebUI's built-in `Original`. This extension builds on `No norm` instead, which multiplies without the rescale.
+- **mean：** プロンプトの区切りごとに、トークンの重みの平均を 1 にそろえます。
+- **length：** 複数の枠を使う Textual Inversion の重みを 1 に近づけます。
+- **/ comfy：** 単純な乗算に代えて、ComfyUI と同じ式で重みを適用します。
 
-The reason is practical: mean restoration is SD1.x era behaviour, and WebUI's own description of `No norm` says it "seems to work better for SDXL". The `Original` based variants can be added later without renaming anything, since `sd_emphasis.options` is just a list.
+選択肢は **Settings → Stable Diffusion → Emphasis mode** に追加されます。ポジティブ・ネガティブの両方に作用します。`<lora:name:0.8>` のような LoRA の強度設定は変更しません。
 
-### mean is computed per chunk
+重みの調整方法は、ComfyUI の [CLIP Text Encode (Advanced)](https://github.com/BlenderNeko/ComfyUI_ADV_CLIP_emb) ノードに由来します。ComfyUI 方式の適用式は ComfyUI 本体に由来します。一部の機能を移植したもので、reForge と ComfyUI で同じ画像を作るための互換機能ではありません。
 
-Upstream flattens the whole prompt and takes one average. reForge creates a separate `Emphasis` object for each 75 token chunk and no state can be carried between them, so the average is taken per chunk.
+## インストールと使い方
 
-**For prompts that fit in a single chunk the two are identical.** Longer prompts differ: upstream preserves the relative difference between chunks, this implementation flattens within each chunk independently. Neither is obviously better. A prompt whose first chunk is deliberately heavier keeps that intent upstream; a prompt suffering from "later tags do not take effect" may do better here.
+1. **Extensions → Install from URL** を開き、次の URL からインストールします。
 
-### length only applies to embeddings
+   ```text
+   https://github.com/seti9585/sd-webui-TokenNorm
+   ```
 
-Upstream divides by the number of tokens a **word** was split into, using `word_id` from `clip.tokenize(return_word_ids=True)`.
+2. WebUI を終了し、起動し直します。インストール後はプロセスごと再起動してください。
+3. 下の選び方を参考に、**Settings → Stable Diffusion → Emphasis mode** で選択します。
+4. **Apply settings** を押し、いつもどおり生成します。
 
-WebUI discards word boundaries. `modules/sd_hijack_clip.py:tokenize_line()` keeps only `(token, multiplier)` pairs, so one word split into three tokens is indistinguishable from three separate words that happen to share a weight.
+WebUI 標準の重み付けに戻す場合は、`Original` を選び、**Apply settings** を押してください。
 
-The one case where the token count survives is a textual inversion embedding: it occupies several consecutive slots whose id is `0`, all carrying the same multiplier. That is verifiable without word boundaries.
+**動作要件：** 対象は reForge です。Forge Classic / Neo はプロンプトの処理経路が異なり、A1111 は未検証です。**Settings → Compatibility → Use old emphasis implementation** は OFF にしてください。Emphasis の処理を通らないように差し替える拡張との併用でも、選択肢が効かなくなる場合があります。
 
-So `length` here rescales only runs made entirely of embedding placeholders. Ordinary tokens are left alone, which also matches upstream for single token words, since `sqrt(1) == 1`. Multi word groups such as `(fluffy white cat:1.5)` are deliberately **not** rescaled: upstream treats those as three separate one token words and leaves them at 1.5.
+## どれを選ぶか
 
-### comfy is sourced from ComfyUI itself
+| 目的 | 選択肢 |
+| --- | --- |
+| WebUI 標準の重み付けを使う | `Original`（本体標準） |
+| 複数枠の Textual Inversion に付けた重みを、1 に近づけたい | `TokenNorm: length` |
+| 各チャンク内のトークンの重みの平均を 1 に保ちたい | `TokenNorm: mean` |
+| length で調整してから、mean で平均をそろえたい | `TokenNorm: length+mean` |
+| 重みを事前に調整せず、ComfyUI の式で適用したい | `TokenNorm: none / comfy` |
+| 重みの調整と ComfyUI の式を組み合わせたい | 下表の対応する `/ comfy` 付きの選択肢 |
 
-`adv_encode.py` does not contain the comfy formula. Its `comfy` branch hands the token/weight pairs to ComfyUI's own encoder, and the interpolation lives in `comfy/sd1_clip.py`, in `ClipTokenWeightEncoder.encode_token_weights`. That is the reference used here.
+**`Original` から切り替えると、入力した重みが同じでも画像が変わることがあります。** `Original` は重み付け後にエンコード結果の平均を元に戻しますが、TokenNorm はこの最後の補正を行いません。length 自体の効果を見るときは、`No norm` と比較してください。
 
-The empty chunk is built as `[id_start, id_end, id_pad * chunk_length]`, which is what reForge itself produces for an empty prompt after `process_tokens()` overwrites everything past the first `id_end` with `id_pad`. It is the same sequence as ComfyUI's `gen_empty_tokens()`. This was checked against the actual `z` of an empty prompt and matched to the last digit for both CLIP-L and CLIP-G. The distinction matters only for CLIP-G, where `id_pad` differs from `id_end`.
+選択肢の全組み合わせ：
 
-`z_empty` depends only on the encoder, the checkpoint and the CLIP skip setting, never on the prompt, so it is computed once and cached on the encoder object, one slot each. This was verified across four prompts, two checkpoints and two CLIP skip settings: recomputations differed by exactly 0.
-
-The pooled output is not affected by weights in ComfyUI either, and reForge carries pooled around the Emphasis step, so nothing is needed there.
-
----
-
-## Not implemented
-
-Upstream offers five interpretations. Only `comfy` is ported.
-
-| interpretation | reference | status |
-|---|---|---|
-| `A1111` | A1111 WebUI | already built in as `Original` / `No norm` |
-| `comfy` | ComfyUI core | **implemented** |
-| `down_weight` | upstream only | not implemented |
-| `compel` | damian0815/compel | not implemented |
-| `comfy++` | upstream only | not implemented |
-
-`comfy` is the only one with a reference outside the upstream extension that this extension can reproduce, and the only one that answers the practical question of why the same prompt behaves differently in ComfyUI.
-
-The other three need extra encoder passes over modified token sequences. `down_weight` and `compel` group tokens by weight value, which is expressible in WebUI, but `comfy++` masks per `word_id`, which WebUI does not retain. `comfy++` is also an invention of the upstream author with no external reference, so there would be nothing to verify a port against.
-
----
-
-## Troubleshooting
-
-**Nothing changes when I switch options.** Check the console at startup. If another extension has replaced `process_tokens` at class level, a warning naming it is printed and no Emphasis option has any effect.
-
-**The infotext does not record my Emphasis setting.** WebUI only writes the `Emphasis` key when the prompt actually contains weighting brackets. Without brackets the setting cannot change anything, so nothing is recorded. This is WebUI behaviour, not this extension.
-
-**`TokenNorm comfy fallback` appears in the infotext.** The comfy interpretation could not resolve the text encoder for that generation and fell back to leaving the embedding untouched, meaning token weights had no effect. The value gives the reason. A pass-through is impossible to spot by eye, which is why it is recorded in the image.
-
-**Debug logging.** Set `SD_WEBUI_SETI_DEBUG` before starting.
-
-```
-set SD_WEBUI_SETI_DEBUG=1
-```
-
-Level 1 reports registration, the startup check, EOS resolution and each `z_empty` computation. Level 2 adds per chunk detail: the `mean` delta, each `length` run, and how many positions the comfy interpolation touched.
-
-## Notes
-
-- A textual inversion embedding is large enough to dominate a chunk. When it does, `mean` is computed mostly from the embedding and the shift pushes ordinary tags well away from 1.0. Applying `length` first reduces this considerably. Both behaviours follow upstream.
-- Switching Emphasis invalidates WebUI's conditioning cache automatically, since `opts.emphasis` is part of the cache key. Fixed seed comparisons are reliable.
-
----
-
-## License
-
-MIT
-
-## Credits
-
-- [BlenderNeko/ComfyUI_ADV_CLIP_emb](https://github.com/BlenderNeko/ComfyUI_ADV_CLIP_emb) - `adv_encode.py`, the origin of the token normalization methods and of the interpretation axis
-- [comfyanonymous/ComfyUI](https://github.com/comfyanonymous/ComfyUI) - `comfy/sd1_clip.py`, `ClipTokenWeightEncoder.encode_token_weights`, the reference for the `comfy` interpretation
-- [Panchovix/stable-diffusion-webui-reForge](https://github.com/Panchovix/stable-diffusion-webui-reForge) and [AUTOMATIC1111/stable-diffusion-webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui) - `modules/sd_emphasis.py`, the extension point this builds on
-- [Shiba-2-shiba](https://note.com/gentle_murre488) - articles that prompted this series of ports
-
----
----
-
-# sd-webui-TokenNorm (日本語)
-
-ComfyUI の `CLIP Text Encode (Advanced)` ノード（[BlenderNeko/ComfyUI_ADV_CLIP_emb](https://github.com/BlenderNeko/ComfyUI_ADV_CLIP_emb)）が持つ **token normalization** と **weight interpretation** を、Stable Diffusion WebUI reForge へ移植したものです。
-
-本体には一切パッチを当てません。`modules.sd_emphasis.options` というモジュールレベルのリストに項目を追加するだけで、それ以外の書き換え・差し替え・ラップは行いません。
-
----
-
-## 何をするものか
-
-`(cat:1.5)` と書いたとき、独立した 2 つの問いが発生します。
-
-1. **その 1.5 を、そのまま使ってよいか。** 複数トークンに分割された語や、多数のベクトルを占める Textual Inversion 埋め込みには、その全てに重みが乗ります。望ましいとは限りません。これが **token normalization** です。
-2. **1.5 倍とは、何を 1.5 倍することか。** ゼロ地点はどこか。A1111 方式は原点からのスケーリング、ComfyUI は空プロンプトの埋め込みからの補間です。これが **weight interpretation** です。
-
-上流ノードはこの 2 軸を持ちます。本拡張も 2 軸を提供します。
-
-## 選択肢
-
-すべて **Settings -> Emphasis** に現れます。生成画面への UI 追加はありません。
-
-| 正規化 | A1111 方式の適用 | ComfyUI 解釈 |
-|---|---|---|
+| 重みの調整 | 乗算（No norm が土台） | ComfyUI の式 |
+| --- | --- | --- |
 | なし | `No norm`（本体標準） | `TokenNorm: none / comfy` |
 | mean | `TokenNorm: mean` | `TokenNorm: mean / comfy` |
 | length | `TokenNorm: length` | `TokenNorm: length / comfy` |
 | length + mean | `TokenNorm: length+mean` | `TokenNorm: length+mean / comfy` |
 
-命名規則は、**接尾辞なしが A1111 方式、`/ comfy` が ComfyUI 解釈**です。「正規化なし × A1111」のセルは本体の `No norm` そのものなので、重複して提供していません。
+## 何が変わるのか
 
-### 正規化
+**トークン**はプロンプトを分割する単位です。1 つのタグが複数トークンになることがあり、カンマも数えます。WebUI は本文を**最大 75 トークンのチャンク**に区切って処理します。**Textual Inversion** は `embeddings` に置き、プロンプトに名前を書いて使う埋め込みファイルで、1 個以上のトークン枠を使います。
 
-**mean** は、内容トークンの重みの平均がちょうど 1.0 になるよう、全体を同じ量だけ加算シフトします。
+### mean：重みの平均を 1 にそろえる
 
+チャンク内の本文トークンの重みに、同じ量を足し引きします。平均が 1 より大きければ全体が下がり、1 より小さければ全体が上がります。カンマや Textual Inversion の枠も対象です。開始・終了マーカーや、長さを埋めるための余白は含みません。
+
+例えば本文トークンが 10 個で、1 個が 1.5、9 個が 1.0 なら、平均は 1.05 です。すべてから 0.05 を引き、**1.45 と 0.95** にします。
+
+そろえるのは重みの数値の平均であり、画像への影響力が一定になる保証ではありません。Textual Inversion がチャンクの大半を占めると、その重みが平均を大きく左右します。
+
+### length：Textual Inversion の重みを 1 に近づける
+
+複数枠の Textual Inversion ごとに、枠数に応じて重みを調整します。1 より上の強調も、1 より下の抑制も弱めます。
+
+26 枠の埋め込みの場合：
+
+| 入力した重み | length 適用後 |
+| --- | --- |
+| 1.5 | 約 1.098 |
+| 0.5 | 約 0.902 |
+| 1.0 | 1.0 |
+
+普通の単語や、1 枠だけの埋め込みは変わりません。埋め込みを隣接させたり `(A, B, C)` とまとめたりした場合も、正確な境界を取得できた場合は別々に処理します。
+
+**length+mean は、length のあとに mean を行います。** そのため、最終的な重みは上の表と異なる場合があります。
+
+### / comfy：調整後の重みの適用方法を変える
+
+`/ comfy` が無い場合は、`No norm` と同じく、各トークンの位置のエンコード後の値に重みを掛けます。
+
+`/ comfy` がある場合は、空のプロンプトが同じ位置に作る値を基準にします。
+
+- **1：** その位置の値を変えません。
+- **0 と 1 の間：** 空プロンプトの値へ近づけます。
+- **0：** 空プロンプトの値に戻します。
+- **1 より上：** 空プロンプトの値からさらに遠ざけます。
+- **0 より下：** 空プロンプトの値を越え、反対側へ動かします。
+
+これは**調整後の重み**の話です。`(tag:0)` と入力しても、mean や length のあとでは 0 以外になる場合があります。どちらの適用方法も、文章から単語を削除する処理ではありません。エンコード後に重みを適用するため、その単語が他の位置に与えた影響は残ります。
+
+`none / comfy` は入力した重みを、`mean / comfy` は平均調整後の重みを、埋め込みの各枠に適用します。どちらも枠数に応じた調整は行いません。重みを付けた複数枠の埋め込みが効きすぎる場合は、対応する `length / comfy` または `length+mean / comfy` を試してください。
+
+## 変化がなくても正常な場合
+
+- **入力の重みがすべて 1：** TokenNorm による追加の重み付けは行われません。なお、`(tag)` は 1.1、`[tag]` は約 0.909 なので、これらも重み指定です。
+- **複数枠の Textual Inversion に重みを付けていない：** 境界を正常に取得できていれば、`length` は `No norm` と、`length / comfy` は `none / comfy` と同じ動作になります。
+- **チャンク内の本文トークンがすべて同じ重み：** mean によって 1 にそろいます。全体を一律に強調しても、その強調は維持されません。
+- **mean に入る時点の重みの平均が 1：** mean による移動はありません。length+mean では、length 適用後の重みについての条件です。
+
+Emphasis mode は reForge のプロンプトのキャッシュ判定に含まれるため、設定を変えると再エンコードされます。選択肢を比較するときは、シードと他の生成設定を固定してください。
+
+## 困ったとき
+
+| 症状 | 確認すること・意味 |
+| --- | --- |
+| 切り替えても変わらない | 上の条件を確認し、**Apply settings** を押してください。**Use old emphasis implementation** が OFF か、起動時に処理の差し替えに関する警告が出ていないかも確認します。 |
+| 起動時の警告にクラス名が出る | プロンプト処理が差し替えられた可能性を検出しています。表示されるのはクラス名で、原因の拡張名とは限りません。既知の競合例に `sd-webui-prevent-artifact` があります。 |
+| 画像情報に `Emphasis` が無い | reForge 標準の経路では、処理対象のプロンプトに `(` または `[` があり、かつ `Original` 以外のときに追加されます。`Original` は省略されます。 |
+| `TokenNorm comfy fallback` が出る | その画像の一部または全部の処理で、ComfyUI 方式の重み付けを省略しました。値に理由が記録されますが、この項目だけでは影響範囲全体は分かりません。コンソールも確認してください。 |
+| `TokenNorm length fallback` が出る | 一部の処理で正確な埋め込みの境界を取得できず、以前の検出方法を使いました。隣接する埋め込みがまとめられたり、誤検出されたりする場合があります。 |
+
+詳しいログが必要な場合は、`webui-user.bat` の**WebUI を起動する行より前**に `set SD_WEBUI_SETI_DEBUG=2` を追加し、再起動してください。`1` は起動情報、`2` は重みの調整や ComfyUI 方式の適用も出力します。無効に戻す場合は、この行を削除して再起動します。
+
+<details>
+<summary>技術的な補足：計算式・実装・ComfyUI との違い</summary>
+
+### 処理順序と計算式
+
+重みの調整を先に行い、その後で適用します。length+mean の順序は length → mean → 選択した適用方法です。
+
+mean（1 チャンク内の本文トークンの重み）：
+
+```text
+delta = 1 - average(weights)
+weights = weights + delta
 ```
-delta = 1 - 内容トークンの重みの平均
-重み  = 重み + delta
-```
 
-したがって、あるタグを強調すると他のタグが引き下げられます。重みの総量が一定に保たれる方式です。
+length（n 枠の埋め込み、重み w）：
 
-**length** は、複数ベクトルの Textual Inversion 埋め込みについて、重みの変化量がベクトル数に比例して膨らまないよう補正します。
-
-```
+```text
 d = w - 1
 w = 1 + sign(d) * sqrt(d * d / n)
 ```
 
-26 ベクトルの埋め込みなら `1.5` は `1.098058` になります。補正しない場合、`(myEmbedding:1.5)` は 26 個すべてに 1.5 を掛けることになります。
+乗算と ComfyUI 方式。w は調整後の重み、z_empty は空プロンプトの同じ位置のエンコード結果です。
 
-### 解釈
-
-**A1111 方式**は、埋め込みに重みを乗算します。重み 0.0 でそのトークンは完全に消えます。
-
-**comfy** は、空プロンプトの埋め込みへ向けて補間します。
-
-```
-z = z_empty + (z - z_empty) * w
+```text
+multiply: z_new = z * w
+comfy:    z_new = z_empty + (z - z_empty) * w
 ```
 
-`z_empty` は 1 本のベクトルではなく、**位置ごとの基準点の列**です。内容を含まないチャンクをエンコードした結果そのものだからです。したがって重み 0.0 はトークンを消すのではなく、その位置を「何も書かなかったときの状態」へ戻します。重み 1.0 の位置はビット単位で変化しません。
+ComfyUI 方式では、調整後の重みが 1 の位置を明示的に保持し、z_empty の引き算・足し算による丸めの変化を避けています。上の式は計算の定義であり、実際の浮動小数点演算には丸めが生じる場合があります。
 
-これが ComfyUI 本来の挙動なので、**あちらと同じ効き方を再現したい場合は `/ comfy` 側**を選んでください。
+### WebUI への組み込み
+
+TokenNorm は `modules.sd_emphasis.options` に選択肢を登録します。WebUI のメソッドを差し替えたり、ラップしたりしません。
+
+length では、呼び出し元のチャンクが保持する `PromptChunk.fixes` を読み取ります。一時的な `hijack.fixes` の参照は既に消されていますが、チャンク自体は残っています。呼び出し元のトークン列が Emphasis の受け取ったものと同一オブジェクトであることと、埋め込みの範囲がトークン位置と一致することを確認します。取得・照合に失敗した場合は、以前のトークン列による推定に戻り、`TokenNorm length fallback` を記録します。
+
+### Advanced ノードとの違い
+
+- **mean：** ノードはプロンプト全体で計算しますが、TokenNorm はチャンクごとに独立して計算します。
+- **length：** ノードは単語 ID から単語ごとのトークン数を求めます。TokenNorm は Textual Inversion の境界を使い、普通の単語は複数トークンに分かれていても変更しません。
+- **A1111 解釈：** ノードは乗算後にエンコード結果の平均を戻します。WebUI の `Original` と同じ考え方です。TokenNorm の乗算の選択肢は `No norm` を土台とし、この補正を行いません。
+- **comfy 解釈：** ComfyUI の空プロンプトを基準とする式を使います。ただし、トークン分割など他の処理も異なるため、条件付けの値や画像の一致は保証しません。
+- **その他の解釈：** `down_weight`、`compel`、`comfy++` は未実装です。
+
+</details>
 
 ---
 
-## 導入
-
-Extensions -> Install from URL、または `extensions/` に clone してください。
-
-```
-git clone https://github.com/seti9585/sd-webui-TokenNorm
-```
-
-**WebUI をプロセスごと再起動してください。**「Apply and restart UI」では Python が再起動しないため不十分です。
-
-その後 **Settings -> Emphasis** で方式を選びます。
-
-## 動作要件
-
-- **reForge 専用です。** Forge Classic / Neo はテキスト処理を `backend/text_processing/` へ移行しており、本拡張の介入点が存在しません。A1111 本家は未検証です。
-- `sd_emphasis` の経路が生きている必要があります。`process_tokens` をクラスレベルで差し替える拡張が入っていると経路ごと迂回され、**本拡張に限らず Emphasis の設定すべてが無効**になります。起動時に検査し、該当クラス名を挙げて警告します。
-
----
-
-## 原実装との相違点
-
-いずれも意図的な判断であり、実装漏れではありません。
-
-### A1111 方式のセルは平均復元を行いません
-
-上流の `A1111` 解釈は、乗算したあと平均が保たれるよう再スケールします。これは本体の `Original` そのものです。本拡張は再スケールを行わない `No norm` を土台としています。
-
-理由は実用面です。平均復元は SD1.x 時代の挙動であり、本体自身が `No norm` の説明で「SDXL ではこちらのほうが良さそう」と述べています。`Original` 土台版は、名前を一切変えずに後から追加できます（`sd_emphasis.options` は単なるリストのため）。
-
-### mean はチャンク単位で計算します
-
-上流はプロンプト全体を平坦化して 1 つの平均を取ります。reForge は 75 トークンのチャンクごとに `Emphasis` インスタンスを生成し直し、状態を持ち越せないため、平均はチャンクごとになります。
-
-**1 チャンクに収まるプロンプトでは両者は完全に一致します。** それを超えると挙動が分かれます。上流はチャンク間の相対差を保存し、本実装はチャンク内で独立に平坦化します。どちらが優れているとは言えません。前半を意図的に濃くした構成なら上流方式が意図を保ちますが、「後半のタグが効かない」という症状には本実装のほうが向く可能性があります。
-
-### length は埋め込み限定です
-
-上流は、**単語**が何トークンに分割されたかで割ります。`clip.tokenize(return_word_ids=True)` の `word_id` を使うためです。
-
-WebUI は単語境界を捨てます。`modules/sd_hijack_clip.py` の `tokenize_line()` が `(トークン, 重み)` の組しか保持しないため、1 語が 3 トークンに割れたものと、たまたま同じ重みを持つ 3 語とを区別できません。
-
-トークン数が生き残る唯一の例が Textual Inversion 埋め込みです。ID が `0` の連続したスロットを占め、全てが同じ重みを持つため、単語境界なしで判定できます。
-
-そのため本実装の `length` は、埋め込みプレースホルダのみで構成される連続領域だけを補正します。通常トークンは素通しです。これは単一トークン語に対する上流の挙動（`sqrt(1) == 1`）とも一致します。`(fluffy white cat:1.5)` のような複数語のまとまりは**意図的に補正しません**。上流はこれを 1 トークン語 3 個として扱い、1.5 のままにするためです。
-
-### comfy の典拠は ComfyUI 本体です
-
-`adv_encode.py` に comfy の式はありません。`comfy` の分岐はトークンと重みの組を ComfyUI 本体のエンコーダへ渡すだけで、補間は `comfy/sd1_clip.py` の `ClipTokenWeightEncoder.encode_token_weights` にあります。本実装はそちらを典拠としています。
-
-空チャンクは `[id_start, id_end, id_pad * chunk_length]` として構成します。これは `process_tokens()` が最初の `id_end` 以降を `id_pad` で塗り潰した結果、reForge 自身が空プロンプトに対して生成する列であり、ComfyUI の `gen_empty_tokens()` と同型です。実際の空プロンプトの `z` と突き合わせ、CLIP-L / CLIP-G の双方で全桁一致することを確認しています。この違いが問題になるのは `id_pad` が `id_end` と異なる CLIP-G 側だけです。
-
-`z_empty` はエンコーダ・チェックポイント・CLIP skip 設定のみに依存し、プロンプトには依存しません。したがって 1 度だけ計算し、エンコーダオブジェクトに 1 スロットずつキャッシュします。4 種のプロンプト、2 つのチェックポイント、2 つの CLIP skip 設定で検証し、再計算値の差は厳密に 0 でした。
-
-pooled 出力は ComfyUI 側でも重みの影響を受けません。reForge も Emphasis の前後で pooled を退避・復帰させるため、こちらで対処すべきことはありません。
-
----
-
-## 実装していないもの
-
-上流は 5 種類の解釈を提供しますが、移植したのは `comfy` のみです。
-
-| 解釈 | 典拠 | 状態 |
-|---|---|---|
-| `A1111` | A1111 WebUI | 本体に `Original` / `No norm` として実装済み |
-| `comfy` | ComfyUI 本体 | **実装** |
-| `down_weight` | 上流のみ | 未実装 |
-| `compel` | damian0815/compel | 未実装 |
-| `comfy++` | 上流のみ | 未実装 |
-
-`comfy` は、上流拡張の外に典拠があり、かつ本拡張で再現可能な唯一の解釈です。また「同じプロンプトなのに ComfyUI と効き方が違う」という実務上の疑問に直接答えるものでもあります。
-
-残る 3 つは、トークン列を書き換えた追加エンコードを必要とします。`down_weight` と `compel` は重み値でトークンをまとめるため WebUI でも表現可能ですが、`comfy++` は `word_id` 単位でマスクするため成立しません。加えて `comfy++` は上流作者の独自実装であり外部典拠が存在しないため、移植しても照合対象がありません。
-
----
-
-## トラブルシューティング
-
-**方式を切り替えても何も変わらない。** 起動時のコンソールを確認してください。`process_tokens` をクラスレベルで差し替える拡張が入っている場合、そのクラス名を挙げた警告が出ます。この状態では Emphasis の設定は一切効きません。
-
-**infotext に Emphasis 設定が記録されない。** WebUI は、プロンプトに重み指定の括弧が含まれるときにのみ `Emphasis` キーを書き出します。括弧が無ければ設定は何も変えないため、記録もされません。本体の挙動であり、本拡張によるものではありません。
-
-**infotext に `TokenNorm comfy fallback` が出た。** その生成で comfy 解釈がテキストエンコーダを特定できず、埋め込みに触れずに素通ししたことを意味します。つまりトークンの重みが効いていません。値に理由が入ります。素通しは目視では判別できないため、画像側に記録する設計にしています。
-
-**デバッグログ。** 起動前に `SD_WEBUI_SETI_DEBUG` を設定してください。
-
-```
-set SD_WEBUI_SETI_DEBUG=1
-```
-
-レベル 1 で、登録・起動時検査・EOS の解決・`z_empty` の計算が出ます。レベル 2 でチャンクごとの詳細（`mean` の delta、`length` の各 run、comfy が補間した位置数）が追加されます。
-
-## 補足
-
-- Textual Inversion 埋め込みはチャンクの大半を占めることがあります。その場合 `mean` の平均は埋め込みに支配され、シフトによって通常タグが 1.0 から大きく引き離されます。`length` を先に適用するとこれはかなり緩和されます。どちらも上流どおりの挙動です。
-- Emphasis を切り替えると本体の conditioning キャッシュは自動的に無効化されます（`opts.emphasis` がキャッシュキーに含まれるため）。固定 seed での比較は信頼できます。
-
----
-
-## ライセンス
+## License / ライセンス
 
 MIT
 
-## 典拠・謝辞
+## Acknowledgements / 謝辞
 
-- [BlenderNeko/ComfyUI_ADV_CLIP_emb](https://github.com/BlenderNeko/ComfyUI_ADV_CLIP_emb) — `adv_encode.py`。token normalization 各方式および解釈軸の原典
-- [comfyanonymous/ComfyUI](https://github.com/comfyanonymous/ComfyUI) — `comfy/sd1_clip.py` の `ClipTokenWeightEncoder.encode_token_weights`。`comfy` 解釈の典拠
-- [Panchovix/stable-diffusion-webui-reForge](https://github.com/Panchovix/stable-diffusion-webui-reForge) および [AUTOMATIC1111/stable-diffusion-webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui) — `modules/sd_emphasis.py`。本拡張が乗っている拡張点
-- [Shiba-2-shiba](https://note.com/gentle_murre488) — 一連の移植のきっかけとなった記事
+- [Shiba-2-shiba](https://note.com/gentle_murre488) — articles that prompted this series of ports / 一連の移植のきっかけとなった記事
+
+## References / 典拠
+
+- [BlenderNeko/ComfyUI_ADV_CLIP_emb — adv_encode.py](https://github.com/BlenderNeko/ComfyUI_ADV_CLIP_emb/blob/master/adv_encode.py) — weight adjustment and interpretation options / 重みの調整と解釈の原典
+- [ComfyUI — comfy/sd1_clip.py](https://github.com/comfyanonymous/ComfyUI/blob/master/comfy/sd1_clip.py) — `ClipTokenWeightEncoder.encode_token_weights`, the ComfyUI application formula / ComfyUI 方式の適用式
+- [reForge — modules/sd_emphasis.py](https://github.com/Panchovix/stable-diffusion-webui-reForge/blob/main/modules/sd_emphasis.py) — Emphasis options and application / Emphasis の選択肢と適用処理
+- [reForge — modules/sd_hijack_clip.py](https://github.com/Panchovix/stable-diffusion-webui-reForge/blob/main/modules/sd_hijack_clip.py) — prompt chunks and the Emphasis call path / チャンクと Emphasis の呼び出し経路
+- [AUTOMATIC1111 — modules/sd_emphasis.py](https://github.com/AUTOMATIC1111/stable-diffusion-webui/blob/master/modules/sd_emphasis.py) — upstream Emphasis implementation / 元となる Emphasis の実装
